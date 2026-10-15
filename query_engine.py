@@ -4,11 +4,11 @@ import calendar
 from datetime import date
 
 from analytics import (
-    ORDERS,
     filter_orders,
     summarize,
     revenue_by,
     available_values,
+    amount_in_usd,
 )
 
 
@@ -30,8 +30,12 @@ MONTHS.update({
 
 
 # --------------------------------------------------
-# Entity extraction
+# General helpers
 # --------------------------------------------------
+
+def contains_any(text, phrases):
+    return any(phrase in text for phrase in phrases)
+
 
 def find_value(question, field):
     """Find a known dataset value mentioned in a question."""
@@ -43,7 +47,7 @@ def find_value(question, field):
         if re.search(pattern, q):
             return value
 
-    # Handle simple product plurals, e.g. 'air fryers'.
+    # Handle simple product plurals, e.g. air fryers.
     if field == "product":
         for value in values:
             plural = value.casefold() + "s"
@@ -59,10 +63,7 @@ def find_value(question, field):
 # --------------------------------------------------
 
 def find_date_range(question):
-    """
-    Extract a month/year or year from a question.
-    Returns (start_date, end_date, clarification).
-    """
+    """Extract a month/year or year from a question."""
     q = question.casefold()
 
     year_match = re.search(r"\b(20\d{2})\b", q)
@@ -98,22 +99,18 @@ def find_date_range(question):
 
 
 # --------------------------------------------------
-# Question intent detection
+# Main question engine
 # --------------------------------------------------
 
-def contains_any(text, phrases):
-    return any(phrase in text for phrase in phrases)
-
-
 def answer_question(question):
-    """Convert a business question into deterministic ledger analytics."""
+    """Answer natural-language questions using ledger analytics."""
 
     if not isinstance(question, str) or not question.strip():
         return "Please provide a non-empty question."
 
     q = question.strip().casefold()
 
-    # Extract filters.
+    # Extract entities and filters.
     region = find_value(q, "region")
     product = find_value(q, "product")
     customer = find_value(q, "customer")
@@ -124,8 +121,6 @@ def answer_question(question):
     if clarification:
         return clarification
 
-    # Filter using created_at dates in Asia/Kolkata, as implemented
-    # in analytics.py.
     orders = filter_orders(
         region=region,
         product=product,
@@ -135,7 +130,7 @@ def answer_question(question):
         end_date=end_date,
     )
 
-    # Detect grouping dimensions.
+    # Determine grouping dimension.
     group_field = None
 
     if contains_any(q, [
@@ -162,10 +157,9 @@ def answer_question(question):
     ]):
         group_field = "customer"
 
-    # Detect the requested metric.
-    asks_revenue = contains_any(q, [
-        "revenue", "sales", "turnover", "earned",
-        "how much money", "total income",
+    # Determine question intent.
+    asks_average = contains_any(q, [
+        "average", "on average", "per order",
     ])
 
     asks_units = contains_any(q, [
@@ -178,6 +172,11 @@ def answer_question(question):
         "total orders", "orders placed",
     ])
 
+    asks_revenue = contains_any(q, [
+        "revenue", "sales", "turnover", "dollars",
+        "how much", "worth",
+    ])
+
     asks_top = contains_any(q, [
         "highest", "most", "top", "best", "maximum",
     ])
@@ -187,24 +186,52 @@ def answer_question(question):
     ])
 
     # --------------------------------------------------
-    # Unit quantity questions
+    # Average paid order value
+    # --------------------------------------------------
+
+    if asks_average:
+        paid_orders = [
+            order for order in orders
+            if order["status"] == "paid"
+        ]
+
+        if not paid_orders:
+            return "No paid orders matched those filters."
+
+        total_revenue = sum(
+            amount_in_usd(order)
+            for order in paid_orders
+        )
+
+        average = total_revenue / len(paid_orders)
+
+        return (
+            "Average paid order value for the matching orders "
+            f"was ${average:,.2f} USD "
+            f"({len(paid_orders)} paid orders)."
+        )
+
+    # --------------------------------------------------
+    # Units sold
     # --------------------------------------------------
 
     if asks_units:
+        paid_orders = [
+            order for order in orders
+            if order["status"] == "paid"
+        ]
+
         paid_units = sum(
             int(order["qty"])
-            for order in orders
-            if order["status"] == "paid"
+            for order in paid_orders
         )
 
         return f"Total units in matching paid orders: {paid_units}."
 
     # --------------------------------------------------
-    # Grouped revenue questions
+    # Grouped revenue
     # --------------------------------------------------
 
-    
-    # Grouped revenue questions
     if asks_revenue and group_field:
         totals = revenue_by(orders, group_field)
 
@@ -227,7 +254,11 @@ def answer_question(question):
 
         lines = [
             f"{name}: ${amount:,.2f} USD"
-            for name, amount in totals.items()
+            for name, amount in sorted(
+                totals.items(),
+                key=lambda item: item[1],
+                reverse=True,
+            )
         ]
 
         return (
@@ -235,39 +266,67 @@ def answer_question(question):
             + "\n".join(lines)
         )
 
+    # --------------------------------------------------
+    # Highest/lowest revenue without an explicit grouping
+    # --------------------------------------------------
+
+    if asks_revenue and (asks_top or asks_lowest):
+        dimension = (
+            "product" if product is None else
+            "region" if region is None else
+            "customer" if customer is None else
+            "product"
+        )
+
+        totals = revenue_by(orders, dimension)
+
+        if not totals:
+            return "No paid orders matched those filters."
+
+        if asks_top:
+            name = max(totals, key=totals.get)
+            label = "highest"
+        else:
+            name = min(totals, key=totals.get)
+            label = "lowest"
+
+        return (
+            f"{name} had the {label} paid revenue: "
+            f"${totals[name]:,.2f} USD."
+        )
 
     # --------------------------------------------------
-    # Revenue questions
+    # Total revenue
     # --------------------------------------------------
 
     if asks_revenue:
         result = summarize(orders)
 
         return (
-            f"Paid revenue for the matching orders was "
+            "Paid revenue for the matching orders was "
             f"${result['paid_revenue_usd']:,.2f} USD."
         )
 
     # --------------------------------------------------
-    # Status-specific counts
+    # Order counts
     # --------------------------------------------------
 
     if asks_count:
-        if "paid" in q:
+        if status == "paid" or "paid" in q:
             count = sum(
                 order["status"] == "paid"
                 for order in orders
             )
             return f"Number of matching paid orders: {count}."
 
-        if "refunded" in q:
+        if status == "refunded" or "refunded" in q:
             count = sum(
                 order["status"] == "refunded"
                 for order in orders
             )
             return f"Number of matching refunded orders: {count}."
 
-        if "void" in q:
+        if status == "void" or "void" in q:
             count = sum(
                 order["status"] == "void"
                 for order in orders
@@ -277,7 +336,7 @@ def answer_question(question):
         return f"Number of matching current orders: {len(orders)}."
 
     # --------------------------------------------------
-    # Summary questions
+    # Summary
     # --------------------------------------------------
 
     if contains_any(q, ["summary", "overview", "breakdown"]):
@@ -285,13 +344,14 @@ def answer_question(question):
 
     return (
         "I couldn't confidently interpret that question. "
-        "Try asking about paid revenue, order counts, units sold, "
-        "or revenue grouped by region or product."
+        "Try asking about paid revenue, average order value, "
+        "order counts, units sold, or revenue grouped by region "
+        "or product."
     )
 
 
 # --------------------------------------------------
-# Local tests
+# Regression tests
 # --------------------------------------------------
 
 if __name__ == "__main__":
@@ -310,11 +370,11 @@ if __name__ == "__main__":
         "Show revenue by region in 2026",
         "What was the lowest revenue by product in March 2026?",
         "How many orders were placed in 2025?",
-        "What was the lowest revenue by product in March 2026?",
-"Which product had the highest revenue in South?",
-"How much paid revenue came from refunded orders?",
-"How many units were sold in South?",
-"Show revenue by region in March 2026",
+        "Which product had the highest revenue in South?",
+        "How much paid revenue came from refunded orders?",
+        "How many units were sold in South?",
+        "Show revenue by region in March 2026",
+        "On average, how many US dollars is a paid West order worth?",
     ]
 
     for question in test_questions:
